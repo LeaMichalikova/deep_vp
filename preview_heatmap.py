@@ -1,11 +1,11 @@
 import os
-
 import cv2
 import numpy as np
-
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 import tensorflow_hub as hub
-from eval.extract_vp_utils import filter_boxes_bcp
 
+from eval.extract_vp_utils import filter_boxes_bcp
 from models.hourglass import load_model, parse_command_line
 from utils.diamond_space import get_focal, process_heatmaps
 from utils.video import get_cap
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Tuple
 import copy
 
+import pdb
 
 def pretty_line(img: np.array, p1: Tuple[float], p2: Tuple[float], color: Tuple[int, int, int],
                 thickness: int) -> np.array:
@@ -42,50 +43,61 @@ def preview():
     heatmap_model, scales, _, _ = load_model(args)
     print("Heatmap model loaded!")
 
-    object_detecor = hub.load('https://tfhub.dev/tensorflow/centernet/resnet50v1_fpn_512x512/1')
+    # Load TensorFlow 1.x model
+    detector = hub.Module("https://www.kaggle.com/models/google/faster-rcnn-inception-resnet-v2/TensorFlow1/faster-rcnn-openimages-v4-inception-resnet-v2/1")
+    input_tensor = tf.placeholder(tf.float32, [1, None, None, 3])
+    output_dict = detector(input_tensor, as_dict=True)
+
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
+    sess.run(tf.tables_initializer())
     print("Object detection model loaded!")
 
     cap = get_cap(args.path)
-    # cap.set(cv2.CAP_PROP_POS_FRAMES, 100)
 
-    vp1s = []
-    vp2s = []
-    fs = []
-    ms = []
-    b1s = []
-    b2s = []
-
+    vp1s, vp2s, fs, ms, b1s, b2s = [], [], [], [], [], []
     prev_edge = None
-
     ret = True
+    outer_counter = 0
+
     while ret:
-        # for _ in range(10):
-        #     ret, frame = cap.read()
-        # frame = cv2.bitwise_and(frame, frame, mask=mask)
-
+        # pdb.set_trace()
         ret, frame = cap.read()
+        if not ret:
+            break
 
-        principal_point = np.array([frame.shape[1] / 2 + 0.5, frame.shape[0] / 2 + 0.5])
+        outer_counter += 1
 
-        result = object_detecor(frame[np.newaxis, :, :, ::-1])
-        boxes, labels, scores = result["detection_boxes"].numpy()[0], result["detection_classes"].numpy()[0], result["detection_scores"].numpy()[0]
-        l = np.logical_and(scores > 0.5, labels == 3)
-        boxes = boxes[l]
-        scores = scores[l]
+        # Preprocess frame for detection
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        input_frame = frame_rgb[np.newaxis, ...].astype(np.float32) / 255.0
+
+        result = sess.run(output_dict, feed_dict={input_tensor: input_frame})
+        # pdb.set_trace()
+        boxes = result["detection_boxes"]
+        class_names = result["detection_class_names"]
+        class_entities = result["detection_class_entities"]
+        scores = result["detection_scores"]
+
+        # Filter for 'Car'
+        car_filter = np.logical_and(scores > 0.5, np.array(class_entities) == b'Car')
+        boxes = boxes[car_filter]
+        scores = scores[car_filter]
 
         boxes, scores, _, prev_edge = filter_boxes_bcp(boxes, scores, frame, prev_edge)
 
-        # boxes = boxes[np.logical_and(scores > 0.1, labels == 3)]
         showing_frame = copy.deepcopy(frame)
         showing_frame = cv2.resize(showing_frame, args.resize_imshow_frame_into)
-
-        showing_frame = write_helper_on_image(showing_frame)
-
-        cv2.imshow("Frame", showing_frame)
+        # showing_frame = write_helper_on_image(showing_frame)
+        # cv2.imshow("Frame", showing_frame)
+        cv2.imwrite(f"image_outputs/Frame{outer_counter}.png", showing_frame)
+        print("imwrite 1")
         cv2.waitKey(30)
 
+        # pdb.set_trace()
+        inner_counter = 0
         for box in boxes:
-            x_min = int(1920 * box[1])  # todo: remove magic numbers
+            x_min = int(1920 * box[1]) # todo: remove magic numbers
             y_min = int(1080 * box[0])
             x_max = int(1920 * box[3] + 1)
             y_max = int(1080 * box[2] + 1)
@@ -96,8 +108,7 @@ def preview():
             car = frame[y_min:y_max, x_min:x_max, :]
             car = cv2.resize(car, (args.input_size, args.input_size), cv2.INTER_CUBIC)
 
-            heatmap_pred = heatmap_model.predict(car[np.newaxis, ...] / 255)
-
+            heatmap_pred = heatmap_model.predict(car[np.newaxis, ...] / 255.0)
             pred_vps, pred_vars = process_heatmaps(heatmap_pred[-1], scales)
 
             vp1_var = pred_vars[0, :, 0]
@@ -111,10 +122,13 @@ def preview():
             vp1 = box_scale * vp1_box + box_center
             vp2 = box_scale * vp2_box + box_center
 
+            principal_point = np.array([frame.shape[1] / 2 + 0.5, frame.shape[0] / 2 + 0.5])
             focal = get_focal(vp1, vp2, principal_point)
             m = (vp1[1] - vp2[1]) / (vp1[0] - vp2[0])
             b1 = vp1[1] - m * vp1[0]
             b2 = vp2[1] - m * vp2[0]
+
+            inner_counter += 1
 
             if not np.isnan(focal) and not np.isinf(m) and not np.isnan(m):
                 vp1s.append(vp1)
@@ -125,7 +139,6 @@ def preview():
                 b2s.append(b2)
 
                 print("VP1: {} \t VP2: {} \t focal: {}".format(vp1, vp2, focal))
-
                 print("Median horizon y = {} * x + {}".format(np.nanmedian(ms), np.nanmedian(np.concatenate([b1s, b2s]))))
                 print("Median focal {}".format(np.nanmedian(fs)))
 
@@ -135,43 +148,42 @@ def preview():
                     frame_scale = pretty_line(frame_scale, box_center, vp2, (0, 0, 255), 2)
                     frame_scale = pretty_line(frame_scale, vp1, vp2, (0, 255, 255), 2)
                 except Exception:
-                    ...
+                    pass
 
                 frame_scale = cv2.resize(frame_scale, args.resize_imshow_frame_into)
                 black_image = np.zeros((frame_scale.shape[0], args.input_size, 3), np.uint8)
                 black_image[0:args.input_size, 0:args.input_size, :] = car
                 frame_scale = cv2.hconcat((frame_scale, black_image))
-                frame_scale = write_helper_on_image(frame_scale)
-                cv2.imshow("Frame", frame_scale)
-                if cv2.waitKey(0) == ord('s'):
-                    # save heatmaps
+                # frame_scale = write_helper_on_image(frame_scale)
 
-                    print("VP1 var idx: ", vp1_var_idx)
-                    print("VP2 var idx: ", vp2_var_idx)
-                    print("VP1 var: ", vp1_var)
-                    print("VP2 var: ", vp2_var)
+                # cv2.imshow("Frame", frame_scale)
+                cv2.imwrite(f"image_outputs/Frame{outer_counter}_{inner_counter}.png", frame_scale)
+                print(f"imwrite {inner_counter}")
+                # if cv2.waitKey(0) == ord('s'):
+                # save heatmaps
 
-                    print("xmin: ", x_min)
-                    print("xmax: ", x_max)
-                    print("ymin: ", y_min)
-                    print("ymax: ", x_max)
+                print("VP1 var idx: ", vp1_var_idx)
+                print("VP2 var idx: ", vp2_var_idx)
+                print("VP1 var: ", vp1_var)
+                print("VP2 var: ", vp2_var)
 
-                    Path("datasets/vis/").mkdir(parents=True, exist_ok=True)
-                    ok = cv2.imwrite("datasets/vis/frame_preview.png", frame)
-                    assert ok
-                    ok = cv2.imwrite("datasets/vis/car_preview.png", car)
-                    assert ok
+                print("xmin: ", x_min)
+                print("xmax: ", x_max)
+                print("ymin: ", y_min)
+                print("ymax: ", x_max)
 
-                    heatmap_pred[-1][heatmap_pred[-1] < 0] = 0
+                Path("datasets/vis/").mkdir(parents=True, exist_ok=True)
+                cv2.imwrite("datasets/vis/frame_preview.png", frame)
+                cv2.imwrite("datasets/vis/car_preview.png", car)
 
-                    for vp_idx in range(2):
-                        for scale_idx, scale in enumerate(scales):
-                            idx = len(scales) * vp_idx + scale_idx
-                            cv2.imwrite("datasets/vis/heatmap_preview_vp{}_s{}.png".format(vp_idx + 1, scale),
-                                        cv2.applyColorMap(
-                                            np.uint8(255 * heatmap_pred[-1][0, :, :, idx] / np.max(
-                                                heatmap_pred[-1][0, :, :, idx])),
-                                            cv2.COLORMAP_PARULA))
+                heatmap_pred[-1][heatmap_pred[-1] < 0] = 0
+                for vp_idx in range(2):
+                    for scale_idx, scale in enumerate(scales):
+                        idx = len(scales) * vp_idx + scale_idx
+                        heatmap = heatmap_pred[-1][0, :, :, idx]
+                        heatmap_img = np.uint8(255 * heatmap / np.max(heatmap))
+                        heatmap_colored = cv2.applyColorMap(heatmap_img, cv2.COLORMAP_PARULA)
+                        cv2.imwrite(f"datasets/vis/heatmap_preview_vp{vp_idx+1}_s{scale}.png", heatmap_colored)
 
 
 if __name__ == '__main__':
